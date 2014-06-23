@@ -1,0 +1,119 @@
+Summary:
+--------
+
+A combination of weaknesses in the android GPU driver (kgsl) and ion as
+deployed on snapdragon devices allow access to physical memory to non-
+privileged user.
+
+This effects snapdragon devices with adreno 3xx, with per-process pagetables
+enabled (CONFIG_KGSL_PER_PROCESS_PAGE_TABLE=y).  I have not checked if adreno
+2xx devices are vulnerable to similar sort of attack.
+
+It is not an easy attack, but I believe it should be taken seriously as it
+could allow root access on a wide range of devices.
+
+A proof of concept is enclosed, which writes "Kilroy was here" to a dummy
+buffer (victim) with a known physical address, for purposes of concept.
+
+Before:
+
+   [   11.974607] ###### victim=c11ac000 (813ac000): ""
+
+After:
+
+   [   33.401709] ###### victim=c11ac000 (813ac000): "Kilroy was here"
+
+
+Background
+----------
+
+In the process of researching how kgsl implements per-process pagetables,
+before implementing a similar feature in the upstream msm drm/kms driver, I
+realized that the IOMMU context registers are mapped into the GPU's address
+space and are updated by the CP (command processor).  This enables fast GPU
+process switching without a massive performance penalty.  But it seemed
+risky and I needed to make sure I understood the implications.
+
+Note that while this exploit does require some knowledge about how the GPU
+operates, it does not require any knowledge about registers typically
+programmed from closed src userspace GL drivers, etc.
+
+Description:
+------------
+
+The GPU has two address spaces, essentially the "user" address space, and the
+"supervisor" or protected address space.  Switching between the two, in order
+to gain access to the IOMMU context registers in the "supervisor" address
+space can be accomplished by a simple register write (to CP_STATE_DEBUG_INDEX)
+from a userspace crafted command-stream.
+
+There are a few hurdles:
+ 1) You need to construct replacement first and second level IOMMU
+    pagetables in physically contiguous memory, at a known physical
+    address.  Also the physical addresses of everything to be mapped
+    in the new pages needs to be known.
+ 2) In the supervisor context, the userspace crafted command-stream
+    buffer will become no longer accessible.
+
+The first hurdle is quite low, thanks to ion.  There are a number of carve-
+out ion pools at known physical addresses, if you can be sure to allocate
+while the pool is not in use, you get a buffer at a known PA.  In my proof-
+of-concept, I used the 'mm' pool.
+
+The second hurdle is handled by writing the commands that will actually
+do the context switch into the global 'setstate memory', which is mapped
+at the same gpu virtual address in both supervisor and user contexts.
+The physical address of this buffer is not very easily guessable, but the
+GPU virtual address is.  So we simply construct two identical contextswitch 
+command buffers, one directly in our setstate mirror, and one indirectly
+via writes from command-stream into the original 'setstate memory'.  Then
+take care that the two copies are mapped at identical GPU virtual address
+in the new page-tables.
+
+Once that is accomplished, simply do an IB to the setstate memory, and when
+you return from that indirect-branch you have your new pagetables installed.
+
+So the sequence is:
+ 1) allocate ion buffer at known address.  The first 32K of this buffer
+    are used for first and second level pagetables.  The next 4K for the
+    setstate mirror we create, and the remaining for command-stream.
+    The pagetables created should have mappings for:
+   a) ion buffer, at same gpu virtual address
+   b) iommu context registers, at same gpu virtual address
+   c) setstate mirror, at same gpu virtual address as original setstate
+   d) and of course mapping for the target memory to overwrite (or read)
+ 2) Build command-stream buffers with instructions to switch to supervisor
+    mode, and perform context-switch in setstate mirror.
+ 3) Build first-level command-stream (what we pass to issueibcmds ioctl):
+   a) first instructions to write the same contents as the setstate
+      mirror into the real setstate buffer.
+   b) then perform IB (indirect branch) instruction to jump the
+      commands we just wrote into setstate memory.
+ 4) When the instructions executing in setstate memory switch to super-
+    visor mode, no fault is generated because the setstate memory is
+    mapped in the same location in supervisor mode.
+ 5) And when the instructions executing in setstate memory switch to the
+    new pagetables by writing TTBR0/TTBR1 in the IOMMU registers, no fault
+    is generated because the setstate mirror is mapped at the identical
+    location to original setstate page.
+ 6) Then return from IB back to first level command-stream buffer (also
+    mapped at the identical location in new page tables), which is then
+    free to overwrite target memory (also in new page tables).
+
+Note that the proof of concept crashes the gpu fairly badly after it finishes,
+because I don't bother to setup a replacement first-level ringbuffer.  But
+doesn't mean this couldn't be done if an attacker wanted to be more stealthy.
+
+
+Recommendations:
+----------------
+
+The quickest fix would be to disable CONFIG_KGSL_PER_PROCESS_PAGE_TABLE.
+The setstate memory should also be mapped read-only.  And address space
+randomization could at least make an attack more difficult.
+
+Note however that I have observed some pipelining in the CP.  You can get
+away with a couple more commands in the command stream (due to cache or
+pipelining) after switching to supervisor mode.  I strongly suspect there
+is a window/race where an attacker could overwrite a few dwords of memory
+after simply putting the IOMMU in bypass mode.
