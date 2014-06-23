@@ -23,6 +23,13 @@ After:
 
    [   33.401709] ###### victim=c11ac000 (813ac000): "Kilroy was here"
 
+Note that this issue is addressed by the following security update:
+
+  https://www.codeaurora.org/projects/security-advisories/unprivileged-gpu-command-streams-can-change-iommu-page-table-cve-2014
+
+See also:
+
+  http://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2014-0972
 
 Background
 ----------
